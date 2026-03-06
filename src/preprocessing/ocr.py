@@ -53,7 +53,7 @@ def _ocr_easyocr(images, langs: list[str]) -> list[str]:
 
 
 def _ocr_llm(images, llm_model: Optional[str], max_tokens: int) -> list[str]:
-    llm_model = "claude-haiku-4-5"
+    #llm_model = "claude-haiku-4-5"
     if not llm_model:
         raise ValueError("LLM OCR requires --ocr-llm-model")
 
