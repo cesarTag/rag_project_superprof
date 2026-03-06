@@ -1,0 +1,136 @@
+Metadata-Version: 2.4
+Name: preprocessing
+Version: 0.1.0
+Summary: PDF to RAG preprocessing pipeline with OCR, chunking, and Chroma vectorstore
+Author: Codex
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: langchain>=0.2.14
+Requires-Dist: langchain-community>=0.2.12
+Requires-Dist: langchain-text-splitters>=0.2.2
+Requires-Dist: langchain-chroma>=0.1.4
+Requires-Dist: langchain-anthropic>=0.1.19
+Requires-Dist: sentence-transformers>=2.7.0
+Requires-Dist: chromadb>=0.5.7
+Requires-Dist: pypdf>=4.2.0
+Requires-Dist: pdfplumber>=0.11.0
+Requires-Dist: pymupdf>=1.24.0
+Requires-Dist: pdfminer.six>=20231228
+Requires-Dist: pydantic>=2.7.0
+Requires-Dist: pyyaml>=6.0.1
+Requires-Dist: tqdm>=4.66.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: Pillow>=10.3.0
+Requires-Dist: pdf2image>=1.17.0
+Requires-Dist: pytesseract>=0.3.10
+Requires-Dist: easyocr>=1.7.1
+Provides-Extra: extras
+Requires-Dist: unstructured[pdf]>=0.14.7; extra == "extras"
+Requires-Dist: nltk>=3.9; extra == "extras"
+Requires-Dist: spacy>=3.7; extra == "extras"
+Requires-Dist: beautifulsoup4>=4.12; extra == "extras"
+Requires-Dist: lxml>=5.2; extra == "extras"
+Requires-Dist: langchain-experimental>=0.0.64; extra == "extras"
+
+# PDF Preprocessing Pipeline
+
+End-to-end pipeline to extract text from PDFs (native or scanned), chunk it, build a Chroma vectorstore, and query with Anthropic + LangChain.
+
+## Features
+- Multiple PDF extractors: `pypdf`, `pdfplumber`, `pymupdf`, `pdfminer`, `unstructured`
+- OCR modes: `auto`, `tesseract`, `easyocr`, `llm`, `off`
+- Chunkers: `recursive`, `character`, `token`, `nltk`, `spacy`, `markdown`, `html`, `latex`, `semantic`
+- Chroma vectorstore with SentenceTransformers embeddings
+- Anthropic query (Claude 3.5 by default)
+
+## Install
+```bash
+pip install -r requirements.txt
+pip install -r requirements-extras.txt  # optional
+```
+
+### System dependencies
+- **Tesseract OCR** (required for `tesseract` OCR)
+- **Poppler** (required for `pdf2image` rendering)
+
+## Quick Start
+```bash
+python -m preprocessing.cli list-options
+
+# With default config.yml present:
+python -m preprocessing.cli pipeline
+
+# Or explicitly with flags:
+python -m preprocessing.cli extract \
+  --input-dir ./data/pdfs \
+  --output ./data/out.txt/extracted.jsonl \
+  --extractor pypdf \
+  --ocr auto
+
+python -m preprocessing.cli chunk \
+  --input ./data/out.txt/extracted.jsonl \
+  --output ./data/out.txt/chunks.jsonl \
+  --chunker recursive \
+  --chunk-size 1000 \
+  --chunk-overlap 150
+
+python -m preprocessing.cli index \
+  --input ./data/out.txt/chunks.jsonl \
+  --persist-dir ./data/chroma \
+  --collection pdfs
+
+python -m preprocessing.cli query \
+  --persist-dir ./data/chroma \
+  --collection pdfs \
+  --question "¿De qué trata el documento?"
+```
+
+## One-shot pipeline
+```bash
+python -m preprocessing.cli pipeline
+
+# Override defaults if needed:
+python -m preprocessing.cli pipeline \
+  --input-dir ./data/pdfs \
+  --work-dir ./data/out.txt \
+  --extractor pypdf \
+  --ocr auto \
+  --chunker recursive \
+  --chunk-size 1000 \
+  --chunk-overlap 150 \
+  --collection pdfs
+```
+
+## Smoke script
+```bash
+./scripts/smoke_pipeline.sh ./data/pdfs ./data/out.txt
+```
+
+## Config file
+If you don’t pass `--config`, the CLI auto-loads `config.yml` (preferred) or `config.yaml` from the current working directory.
+Use `--config config.yml` explicitly if you want to point elsewhere. See `config.example.yml`.
+
+## Notes
+- For `semantic` chunking, install `langchain-experimental` and ensure the embedding model is available.
+- For `unstructured` extraction, install `unstructured[pdf]`.
+- Set `ANTHROPIC_API_KEY` in your environment before using `query` or `llm` OCR.
+- The CLI disables Pydantic plugin auto-loading by default to avoid third-party plugin warnings. Unset `PYDANTIC_DISABLE_PLUGINS` if you need plugins.
+- The CLI also sets safe environment defaults to reduce macOS hangs (e.g., transformers/tokenizers thread settings). Use `--no-safe-env` to opt out.
+ - When running from the repo root, `sitecustomize.py` applies these defaults even earlier (before imports).
+
+## Troubleshooting hangs
+If the CLI hangs after a low-level warning (e.g., `mutex.cc`), try these steps:
+1. Ensure TensorFlow is not being loaded by Transformers:
+   - `export TRANSFORMERS_NO_TF=1`
+2. Disable tokenizers parallelism and cap BLAS/OMP threads:
+   - `export TOKENIZERS_PARALLELISM=false`
+   - `export OMP_NUM_THREADS=1`
+   - `export MKL_NUM_THREADS=1`
+   - `export OPENBLAS_NUM_THREADS=1`
+   - `export VECLIB_MAXIMUM_THREADS=1`
+3. If the hang occurs when importing `torch` or `sentence-transformers`, create a clean virtualenv and install pinned requirements:
+   - `python3 -m venv .venv`
+   - `source .venv/bin/activate`
+   - `pip install -r requirements.txt`
+4. Re-run the CLI. If it works, you can leave the defaults enabled (the CLI sets these by default).

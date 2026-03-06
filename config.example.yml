@@ -1,0 +1,42 @@
+# Example configuration for the PDF preprocessing pipeline
+input_dir: "./data/pdfs"
+output_dir: "./data/out"
+recursive: true
+
+extraction:
+  extractor: "pypdf"
+  ocr: "auto"  # auto | tesseract | easyocr | llm | off
+  force_ocr: false
+  ocr_lang: "eng"
+  easyocr_langs: ["en"]
+  min_text_per_page: 25
+  ocr_llm_model: null       # e.g. "claude-3-5-sonnet-latest"
+  ocr_llm_max_tokens: 1024
+
+chunking:
+  chunker: "recursive"
+  chunk_size: 1000
+  chunk_overlap: 150
+  chunk_kwargs: {}
+
+indexing:
+  persist_dir: "./data/chroma"
+  collection: "pdfs"
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+
+query:
+  model: "claude-haiku-4-5"
+  temperature: 0.2
+  k: 5
+  max_tokens: 1024
+  show_sources: true
+  relevance_threshold: null   # applies when score_metric=relevance
+  distance_threshold: null    # applies when score_metric=distance
+  score_metric: "auto"        # auto | relevance | distance
+  rerank:
+    enabled: false
+    model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    top_n: 5
+    threshold: 0.0
+
+
