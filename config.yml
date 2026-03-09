@@ -15,36 +15,37 @@ extraction:
 
 chunking:
   chunker: "recursive"
-  chunk_size: 1000
+  chunk_size: 1024
   chunk_overlap: 150
   chunk_kwargs: {}
 
 indexing:
   persist_dir: "./data/chroma"
   collection: "pdfs"
-  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  #embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  embedding_model: "GPT4AllEmbeddings"
   dedup_by_source: true
 
 query:
   model: "claude-haiku-4-5"
-  temperature: 0.2
-  k: 5
+  temperature: 0.1
+  k: 10
   max_tokens: 1024
   show_sources: true
   relevance_threshold: null   # applies when score_metric=relevance
   distance_threshold: null    # applies when score_metric=distance
   score_metric: "auto"        # auto | relevance | distance
   search:
-    hybrid: false
+    hybrid: true
   rerank:
-    enabled: false
+    enabled: true
     model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    top_n: null            # chunks kept after rerank (defaults to query.k)
-    threshold: 0.0
+    top_n: 5           # chunks kept after rerank (<= k)
+    threshold: -100
 
 comparison:
-  extractors: ["pypdf", "pdfplumber", "pymupdf", "pdfminer", "unstructured"]
-  chunkers: ["recursive", "character", "token", "nltk", "spacy", "markdown", "html", "latex", "semantic"]
+  extractors: ["pypdf", "pymupdf", "pdfplumber", "pdfminer", "unstructured"]
+  chunkers: ["recursive", "token", "character", "nltk", "spacy", "semantic"]
   limit_pdfs: null
   skip_existing: true
   output: "./reports/comparison.md"

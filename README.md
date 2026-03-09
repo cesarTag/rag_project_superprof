@@ -7,6 +7,7 @@ End-to-end pipeline to extract text from PDFs (native or scanned), chunk it, bui
 - OCR modes: `auto`, `tesseract`, `easyocr`, `llm`, `off`
 - Chunkers: `recursive`, `character`, `token`, `nltk`, `spacy`, `markdown`, `html`, `latex`, `semantic`
 - Chroma vectorstore with SentenceTransformers embeddings
+- Optional hybrid retriever (BM25 + vectorstore)
 - Anthropic query (Claude Haiku by default; configurable)
 
 ## Install
@@ -103,6 +104,7 @@ indexing:
   persist_dir: "./data/chroma"
   collection: "pdfs"
   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  dedup_by_source: true      # skip PDFs already indexed (by metadata.source)
 
 query:
   model: "claude-haiku-4-5"
@@ -113,10 +115,12 @@ query:
   relevance_threshold: null  # applies when score_metric=relevance
   distance_threshold: null   # applies when score_metric=distance
   score_metric: "auto"       # auto | relevance | distance
+  search:
+    hybrid: false
   rerank:
     enabled: false
     model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    top_n: 5
+    top_n: null            # number of chunks kept after rerank (defaults to query.k)
     threshold: 0.0
 ```
 
@@ -160,6 +164,9 @@ This will:
 1. Extract text to `output_dir/extracted.jsonl`
 2. Chunk to `output_dir/chunks.jsonl`
 3. Build a Chroma index in `indexing.persist_dir`
+If `indexing.dedup_by_source` is `true`, the pipeline will skip PDFs that already exist in the collection
+(based on `metadata.source`) and will print which files were skipped. If no new PDFs are found, it
+exits without reprocessing.
 
 ### 5) Run step by step
 ```bash
@@ -171,6 +178,8 @@ python3 -m preprocessing.cli query --question "¿De qué trata el documento?"
 Each command uses defaults from `config.yml` unless overridden by flags.
 If you set `query.relevance_threshold`, it applies only when `score_metric=relevance`.
 If you set `query.distance_threshold`, it applies only when `score_metric=distance`.
+`query.k` controls how many chunks are retrieved before reranking.
+`query.rerank.top_n` controls how many of those chunks are kept after reranking and sent to the LLM.
 
 ### 6) Choose extractor and OCR mode
 Extractors (use `--extractor`):
@@ -265,6 +274,10 @@ To enable reranking (optional):
 ```bash
 python3 -m preprocessing.cli query --question "¿De qué trata el documento?" --rerank --rerank-top-n 5 --rerank-threshold 0.0
 ```
+To enable hybrid search (BM25 + vectorstore):
+```bash
+python3 -m preprocessing.cli query --question "¿De qué trata el documento?" --hybrid
+```
 To control which score is used:
 ```bash
 python3 -m preprocessing.cli query --question "¿De qué trata el documento?" --score-metric relevance
@@ -286,6 +299,8 @@ Sources:
 - The CLI disables Pydantic plugin auto-loading by default to avoid third-party plugin warnings. Unset `PYDANTIC_DISABLE_PLUGINS` if you need plugins.
 - The CLI also sets safe environment defaults to reduce macOS hangs (e.g., transformers/tokenizers thread settings). Use `--no-safe-env` to opt out.
  - When running from the repo root, `sitecustomize.py` applies these defaults even earlier (before imports).
+- Hybrid retriever support is available via `create_ensemble_retriever` in `src/preprocessing/vectorstore.py`.
+- Hybrid search requires `BM25Retriever`; if `EnsembleRetriever` is unavailable, a simple rank-fusion fallback is used automatically.
 
 ## Troubleshooting hangs
 If the CLI hangs after a low-level warning (e.g., `mutex.cc`), try these steps:

@@ -94,6 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--rerank-model", default=None)
     query.add_argument("--rerank-top-n", type=int, default=None)
     query.add_argument("--rerank-threshold", type=float, default=None)
+    query.add_argument("--hybrid", action=argparse.BooleanOptionalAction, default=None)
     query.add_argument(
         "--score-metric",
         choices=["auto", "relevance", "distance"],
@@ -117,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--chunk-overlap", type=int, default=None)
     pipeline.add_argument("--chunk-kwargs", default=None)
     pipeline.add_argument("--persist-dir", default=None)
+    pipeline.add_argument("--dedup-by-source", action=argparse.BooleanOptionalAction, default=None)
     pipeline.add_argument("--collection", default=None)
     pipeline.add_argument("--embedding-model", default=None)
     pipeline.add_argument("--ocr-llm-model", default=None)
@@ -304,6 +306,24 @@ def cmd_query(args, cfg):
     from .utils import safe_import
     from .vectorstore import load_vectorstore
 
+    def _doc_key(doc):
+        meta = doc.metadata or {}
+        return (
+            meta.get("source"),
+            meta.get("page"),
+            (doc.page_content or "")[:200],
+        )
+
+    def _format_source(doc, label: str | None, score_label: str | None = None, score=None) -> str:
+        meta = doc.metadata or {}
+        base = f"- {meta.get('source')} (page: {meta.get('page')})"
+        if score_label is not None and score is not None:
+            score_text = f"{score:.4f}" if isinstance(score, (int, float)) else str(score)
+            base += f" | {score_label}: {score_text}"
+        if label:
+            base += f" | {label}"
+        return base
+
     persist_dir = _resolve(args.persist_dir, deep_get(cfg, ["indexing", "persist_dir"]), None)
     if not persist_dir:
         raise SystemExit("query requires --persist-dir (or config indexing.persist_dir)")
@@ -341,12 +361,17 @@ def cmd_query(args, cfg):
     rerank_top_n = _resolve(
         args.rerank_top_n,
         deep_get(cfg, ["query", "rerank", "top_n"]),
-        5,
+        None,
     )
     rerank_threshold = _resolve(
         args.rerank_threshold,
         deep_get(cfg, ["query", "rerank", "threshold"]),
         0.0,
+    )
+    hybrid = _resolve(
+        args.hybrid,
+        deep_get(cfg, ["query", "search", "hybrid"]),
+        False,
     )
     score_metric = _resolve(
         args.score_metric,
@@ -360,6 +385,7 @@ def cmd_query(args, cfg):
         collection=collection,
         embedding_model=embedding_model,
     )
+    print("[query] loaded vectorstore")
 
     langchain_anthropic = safe_import("langchain_anthropic", "langchain-anthropic")
     messages_mod = safe_import("langchain_core.messages", "langchain-core")
@@ -372,35 +398,128 @@ def cmd_query(args, cfg):
     docs = []
     scored_results = None
     score_label = None
+    used_hybrid = False
+    hybrid_labels = {}
+    hybrid_scores = {}
+    hybrid_score_label = "hybrid_score"
     metric = str(score_metric).lower()
     if metric not in ("auto", "relevance", "distance"):
         raise SystemExit("score_metric must be one of: auto, relevance, distance")
 
-    if metric == "relevance":
-        if not hasattr(store, "similarity_search_with_relevance_scores"):
-            raise SystemExit(
-                "Requested relevance scores but this vectorstore does not support them. "
-                "Use score_metric=auto or distance."
+    if hybrid:
+        try:
+            from pathlib import Path
+            from langchain_core.documents import Document
+            from .documents import records_to_docs
+            from .utils import iter_jsonl
+            from .vectorstore import create_ensemble_retriever
+
+            print("[hybrid] enabled: building BM25 + vectorstore ensemble")
+            docs_for_bm25 = []
+            output_dir = deep_get(cfg, ["output_dir"])
+            if output_dir:
+                chunks_path = Path(output_dir) / "chunks.jsonl"
+                if chunks_path.exists():
+                    docs_for_bm25 = records_to_docs(iter_jsonl(chunks_path))
+                    print(f"[hybrid] loaded chunks.jsonl docs: {len(docs_for_bm25)}")
+                else:
+                    print(f"[hybrid] chunks.jsonl not found at: {chunks_path}")
+
+            if not docs_for_bm25 and hasattr(store, "get"):
+                try:
+                    data = store.get(include=["documents", "metadatas"])
+                    docs_for_bm25 = [
+                        Document(page_content=doc, metadata=meta or {})
+                        for doc, meta in zip(data.get("documents", []), data.get("metadatas", []))
+                    ]
+                    print(f"[hybrid] loaded docs from vectorstore.get: {len(docs_for_bm25)}")
+                except Exception:
+                    docs_for_bm25 = []
+
+            if not docs_for_bm25:
+                raise ValueError("No documents available to build BM25 retriever (missing chunks.jsonl?)")
+
+            weights = (0.3, 0.7)
+            ensemble_retriever = create_ensemble_retriever(
+                documents=docs_for_bm25,
+                vectorstore=store,
+                k=int(k),
+                weights=weights,
             )
-        scored_results = store.similarity_search_with_relevance_scores(args.question, k=int(k))
-        score_label = "relevance"
-    elif metric == "distance":
-        if not hasattr(store, "similarity_search_with_score"):
-            raise SystemExit(
-                "Requested distance scores but this vectorstore does not support them. "
-                "Use score_metric=auto or relevance."
-            )
-        scored_results = store.similarity_search_with_score(args.question, k=int(k))
-        score_label = "distance"
-    else:
-        if hasattr(store, "similarity_search_with_relevance_scores"):
+
+            # Retrieve from each source to tag results
+            bm25_retriever = ensemble_retriever.retrievers[0]
+            vector_retriever = ensemble_retriever.retrievers[1]
+
+            if hasattr(bm25_retriever, "invoke"):
+                docs_bm25 = bm25_retriever.invoke(args.question)
+            else:
+                docs_bm25 = bm25_retriever.get_relevant_documents(args.question)
+
+            if hasattr(vector_retriever, "invoke"):
+                docs_vec = vector_retriever.invoke(args.question)
+            else:
+                docs_vec = vector_retriever.get_relevant_documents(args.question)
+
+            print(f"[hybrid] bm25 docs: {len(docs_bm25)} | vector docs: {len(docs_vec)}")
+            for doc in docs_bm25:
+                hybrid_labels[_doc_key(doc)] = "BM25"
+            for doc in docs_vec:
+                key = _doc_key(doc)
+                if key in hybrid_labels:
+                    hybrid_labels[key] = "BM25+Vectorstore"
+                else:
+                    hybrid_labels[key] = "Vectorstore"
+
+            # Compute a simple hybrid score (weighted reciprocal rank)
+            for rank, doc in enumerate(docs_bm25):
+                key = _doc_key(doc)
+                hybrid_scores[key] = hybrid_scores.get(key, 0.0) + weights[0] * (1.0 / (rank + 1))
+            for rank, doc in enumerate(docs_vec):
+                key = _doc_key(doc)
+                hybrid_scores[key] = hybrid_scores.get(key, 0.0) + weights[1] * (1.0 / (rank + 1))
+
+            if hasattr(ensemble_retriever, "invoke"):
+                docs = ensemble_retriever.invoke(args.question)
+            else:
+                docs = ensemble_retriever.get_relevant_documents(args.question)
+            print(f"[hybrid] ensemble docs: {len(docs)}")
+            used_hybrid = True
+        except Exception as exc:
+            print(f"Warning: hybrid search failed, falling back to vectorstore only: {exc}")
+            used_hybrid = False
+            hybrid_labels.clear()
+            hybrid_scores.clear()
+            print("[hybrid] fallback to vectorstore")
+
+    if not used_hybrid:
+        print(f"[query] using score_metric={metric} (vectorstore)")
+        if metric == "relevance":
+            if not hasattr(store, "similarity_search_with_relevance_scores"):
+                raise SystemExit(
+                    "Requested relevance scores but this vectorstore does not support them. "
+                    "Use score_metric=auto or distance."
+                )
             scored_results = store.similarity_search_with_relevance_scores(args.question, k=int(k))
             score_label = "relevance"
-        elif hasattr(store, "similarity_search_with_score"):
+        elif metric == "distance":
+            if not hasattr(store, "similarity_search_with_score"):
+                raise SystemExit(
+                    "Requested distance scores but this vectorstore does not support them. "
+                    "Use score_metric=auto or relevance."
+                )
             scored_results = store.similarity_search_with_score(args.question, k=int(k))
             score_label = "distance"
+        else:
+            if hasattr(store, "similarity_search_with_relevance_scores"):
+                scored_results = store.similarity_search_with_relevance_scores(args.question, k=int(k))
+                score_label = "relevance"
+            elif hasattr(store, "similarity_search_with_score"):
+                scored_results = store.similarity_search_with_score(args.question, k=int(k))
+                score_label = "distance"
 
-    if scored_results is not None:
+    if scored_results is not None and not used_hybrid:
+        print(f"[query] scored_results={len(scored_results)} label={score_label}")
         if score_label == "relevance":
             if distance_threshold is not None:
                 print("Warning: distance_threshold ignored because score_metric=relevance.")
@@ -414,18 +533,36 @@ def cmd_query(args, cfg):
                 threshold = float(distance_threshold)
                 scored_results = [(doc, score) for doc, score in scored_results if score <= threshold]
         docs = [doc for doc, _ in scored_results]
-    else:
+    elif not used_hybrid:
+        print("[query] falling back to retriever")
         retriever = store.as_retriever(search_kwargs={"k": int(k)})
         if hasattr(retriever, "invoke"):
             docs = retriever.invoke(args.question)
         else:
             docs = retriever.get_relevant_documents(args.question)
+        print(f"[query] retriever docs={len(docs)}")
 
-    if scored_results is None and (relevance_threshold is not None or distance_threshold is not None):
+    if not used_hybrid and scored_results is None and (relevance_threshold is not None or distance_threshold is not None):
         print("Warning: threshold was set but scores were unavailable; threshold ignored.")
 
     rerank_scores = None
+    pre_rerank_docs = list(docs)
+    pre_rerank_scored_results = scored_results
+    pre_rerank_hybrid_labels = dict(hybrid_labels)
+    pre_rerank_hybrid_scores = dict(hybrid_scores)
+    retrieved_count = len(docs)
+    if retrieved_count:
+        print(f"[query] retrieved_docs={retrieved_count} (k={k})")
     if rerank_enabled and docs:
+        if rerank_top_n is None:
+            rerank_top_n = int(k)
+        else:
+            rerank_top_n = int(rerank_top_n)
+        if rerank_top_n < int(k):
+            print(
+                f"Warning: rerank_top_n={rerank_top_n} limits results even though k={k}. "
+                "Set query.rerank.top_n=null (or to the same value as k) to keep all results."
+            )
         try:
             from .rerank import RerankOptions, rerank_documents
             rerank_scores = rerank_documents(
@@ -439,6 +576,7 @@ def cmd_query(args, cfg):
                 ),
             )
             docs = [doc for doc, _ in rerank_scores]
+            print(f"[rerank] kept={len(docs)} (top_n={rerank_top_n})")
         except ImportError as exc:
             print(f"Warning: rerank enabled but dependencies missing: {exc}. Continuing without rerank.")
 
@@ -459,23 +597,69 @@ def cmd_query(args, cfg):
     print(answer)
 
     if show_sources and docs:
-        print("\nSources:")
-        if scored_results is not None:
-            for doc, score in scored_results:
-                meta = doc.metadata or {}
-                score_text = f"{score:.4f}" if isinstance(score, (int, float)) else str(score)
-                print(f"- {meta.get('source')} (page: {meta.get('page')}) | {score_label}: {score_text}")
-        else:
-            for doc in docs:
-                meta = doc.metadata or {}
-                print(f"- {meta.get('source')} (page: {meta.get('page')}) | score: N/A")
+        if rerank_enabled:
+            print("\nSources (pre-rerank):")
+            if used_hybrid:
+                for doc in pre_rerank_docs:
+                    key = _doc_key(doc)
+                    label = pre_rerank_hybrid_labels.get(key)
+                    if hybrid and not label:
+                        label = "Vectorstore"
+                    score = pre_rerank_hybrid_scores.get(key)
+                    if score is not None:
+                        print(_format_source(doc, label, score_label=hybrid_score_label, score=score))
+                    else:
+                        print(_format_source(doc, label))
+            elif pre_rerank_scored_results is not None:
+                for doc, score in pre_rerank_scored_results:
+                    label = pre_rerank_hybrid_labels.get(_doc_key(doc))
+                    print(_format_source(doc, label, score_label=score_label, score=score))
+            else:
+                for doc in pre_rerank_docs:
+                    label = pre_rerank_hybrid_labels.get(_doc_key(doc))
+                    if hybrid and not label:
+                        label = "Vectorstore"
+                    print(_format_source(doc, label))
 
-    if rerank_scores is not None:
+            print("\nSources (post-rerank):")
+            if rerank_scores is not None:
+                for doc, score in rerank_scores:
+                    label = hybrid_labels.get(_doc_key(doc))
+                    print(_format_source(doc, label, score_label="rerank_score", score=score))
+            else:
+                for doc in docs:
+                    label = hybrid_labels.get(_doc_key(doc))
+                    print(_format_source(doc, label))
+        else:
+            print("\nSources:")
+            if used_hybrid:
+                for doc in docs:
+                    key = _doc_key(doc)
+                    label = hybrid_labels.get(key)
+                    if hybrid and not label:
+                        label = "Vectorstore"
+                    score = hybrid_scores.get(key)
+                    if score is not None:
+                        print(_format_source(doc, label, score_label=hybrid_score_label, score=score))
+                    else:
+                        print(_format_source(doc, label))
+            elif scored_results is not None:
+                for doc, score in scored_results:
+                    label = hybrid_labels.get(_doc_key(doc))
+                    print(_format_source(doc, label, score_label=score_label, score=score))
+            else:
+                for doc in docs:
+                    label = hybrid_labels.get(_doc_key(doc))
+                    if hybrid and not label:
+                        label = "Vectorstore"
+                    print(_format_source(doc, label))
+
+    '''if rerank_scores is not None:
         print("\nRerank:")
         for doc, score in rerank_scores:
             meta = doc.metadata or {}
             score_text = f"{score:.4f}" if isinstance(score, (int, float)) else str(score)
-            print(f"- {meta.get('source')} (page: {meta.get('page')}) | rerank_score: {score_text}")
+            print(f"- {meta.get('source')} (page: {meta.get('page')}) | rerank_score: {score_text}")'''
 
 
 def cmd_pipeline(args, cfg):
@@ -484,7 +668,7 @@ def cmd_pipeline(args, cfg):
     from .documents import docs_to_records, records_to_docs
     from .extraction import ExtractionOptions, extract_pdf_to_documents
     from .utils import find_pdfs, iter_jsonl
-    from .vectorstore import build_vectorstore, get_embeddings
+    from .vectorstore import get_embeddings, load_vectorstore, add_documents_dedup_by_source, get_existing_sources
 
     input_dir = _resolve(args.input_dir, deep_get(cfg, ["input_dir"]), None)
     output_dir = _resolve(args.work_dir, deep_get(cfg, ["output_dir"]), None)
@@ -496,6 +680,17 @@ def cmd_pipeline(args, cfg):
     extract_output = work_dir / "extracted.jsonl"
     chunk_output = work_dir / "chunks.jsonl"
     persist_dir = _resolve(args.persist_dir, deep_get(cfg, ["indexing", "persist_dir"]), str(work_dir / "chroma"))
+    dedup_by_source = _resolve(
+        args.dedup_by_source,
+        deep_get(cfg, ["indexing", "dedup_by_source"]),
+        True,
+    )
+    embedding_model = _resolve(
+        args.embedding_model,
+        deep_get(cfg, ["indexing", "embedding_model"]),
+        "sentence-transformers/all-MiniLM-L6-v2",
+    )
+    collection = _resolve(args.collection, deep_get(cfg, ["indexing", "collection"]), "pdfs")
 
     # Reuse extract configuration
     extractor = _resolve(args.extractor, deep_get(cfg, ["extraction", "extractor"]), "pypdf")
@@ -530,9 +725,28 @@ def cmd_pipeline(args, cfg):
     if not pdfs:
         print("No PDFs found")
         return
+    store = None
+    pdfs_to_process = list(pdfs)
+    if dedup_by_source:
+        store = load_vectorstore(
+            persist_dir=persist_dir,
+            collection=collection,
+            embedding_model=embedding_model,
+        )
+        existing_sources = get_existing_sources(store)
+        skipped_pdfs = [pdf for pdf in pdfs if str(pdf) in existing_sources]
+        pdfs_to_process = [pdf for pdf in pdfs if str(pdf) not in existing_sources]
+        if skipped_pdfs:
+            print("Skipping already indexed PDFs:")
+            for pdf in skipped_pdfs:
+                print(f"- {pdf}")
+        if not pdfs_to_process:
+            print("No new PDFs to process. Collection is up to date.")
+            print(f"Chroma: {persist_dir} (collection: {collection})")
+            return
 
     with extract_output.open("w", encoding="utf-8") as f:
-        for pdf_path in tqdm(pdfs, desc="Extracting"):
+        for pdf_path in tqdm(pdfs_to_process, desc="Extracting"):
             docs = extract_pdf_to_documents(pdf_path, options)
             for record in docs_to_records(docs):
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -541,13 +755,6 @@ def cmd_pipeline(args, cfg):
     chunk_size = _resolve(args.chunk_size, deep_get(cfg, ["chunking", "chunk_size"]), 1000)
     chunk_overlap = _resolve(args.chunk_overlap, deep_get(cfg, ["chunking", "chunk_overlap"]), 150)
     chunk_kwargs = _resolve(args.chunk_kwargs, deep_get(cfg, ["chunking", "chunk_kwargs"]), None)
-    embedding_model = _resolve(
-        args.embedding_model,
-        deep_get(cfg, ["indexing", "embedding_model"]),
-        "sentence-transformers/all-MiniLM-L6-v2",
-    )
-    collection = _resolve(args.collection, deep_get(cfg, ["indexing", "collection"]), "pdfs")
-
     splitter_kwargs = parse_chunk_kwargs(chunk_kwargs)
     embeddings = None
     if chunker == "semantic":
@@ -568,12 +775,24 @@ def cmd_pipeline(args, cfg):
         for record in docs_to_records(chunks):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    build_vectorstore(
-        documents=chunks,
-        persist_dir=persist_dir,
-        collection=collection,
-        embedding_model=embedding_model,
-    )
+    if store is None:
+        store = load_vectorstore(
+            persist_dir=persist_dir,
+            collection=collection,
+            embedding_model=embedding_model,
+        )
+    if dedup_by_source:
+        added, skipped_sources = add_documents_dedup_by_source(store, chunks)
+        if skipped_sources:
+            print("Skipped existing sources:")
+            for source in skipped_sources:
+                print(f"- {source}")
+        print(f"Added {added} new chunks to collection '{collection}'")
+    else:
+        store.add_documents(chunks)
+        if hasattr(store, "persist"):
+            store.persist()
+        print(f"Added {len(chunks)} chunks to collection '{collection}'")
 
     print("Pipeline complete")
     print(f"Extracted: {extract_output}")

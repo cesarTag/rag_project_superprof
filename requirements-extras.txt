@@ -1,8 +1,8 @@
-# Optional extras (from pyproject.toml)
-unstructured[pdf]==0.14.7
-nltk==3.9
-spacy==3.7
-beautifulsoup4==4.12
-lxml==5.2
-langchain-experimental==0.0.64
+# Optional extras (from current venv)
+unstructured[pdf]==0.21.5
+nltk==3.9.3
+spacy==3.8.11
+beautifulsoup4==4.14.3
+lxml==6.0.2
+langchain-experimental==0.4.1
 pytest==8.0.0
