@@ -48,6 +48,9 @@ Total runs: 24
 - Index time (s): N/A
 - Query time (s): 2.88
 
+## **Question**
+### ¿Cual es el paradigma que sigue el mecanismo de memoria Memento?
+
 **Answer**
 
 # Respuesta
